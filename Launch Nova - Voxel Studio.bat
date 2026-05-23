@@ -44,6 +44,16 @@ if not exist "node_modules" (
   goto :start
 )
 
+REM If dist exists but branding changed since the last build, rebuild.
+set "NEED_REBUILD="
+for /f %%I in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$dist='dist\\index.html'; if(!(Test-Path $dist)){ '1'; exit }; $src=(Get-ChildItem -Recurse 'public\\branding' -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc; $dst=(Get-Item $dist).LastWriteTimeUtc; if($src -gt $dst){ '1' } else { '0' }"') do set "NEED_REBUILD=%%I"
+if "%NEED_REBUILD%"=="1" (
+  echo Rebuilding...
+  call %NPM_CMD% run build
+  if errorlevel 1 goto :err
+  goto :start
+)
+
 if not exist "dist\\index.html" (
   echo Building app...
   call %NPM_CMD% run build
