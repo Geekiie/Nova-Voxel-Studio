@@ -1,0 +1,54 @@
+{
+  "name": "nova-voxel-studio",
+  "version": "0.1.0",
+  "private": false,
+  "productName": "Nova - Voxel Studio",
+  "description": "Convert, edit, and export voxel models for Cube World.",
+  "author": "Nova Voxel Studio",
+  "main": "electron-main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build --base=./",
+    "preview": "vite preview",
+    "desktop": "electron .",
+    "desktop:dev": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "npm run build && electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^25.1.8",
+    "vite": "^8.0.12"
+  },
+  "dependencies": {
+    "sql.js": "^1.10.3",
+    "three": "^0.184.0"
+  },
+  "build": {
+    "appId": "com.nova.voxelstudio",
+    "productName": "Nova - Voxel Studio",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "public/**/*",
+      "electron-main.cjs",
+      "preload.cjs",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "public/branding/app_icon.png"
+    }
+  }
+}
