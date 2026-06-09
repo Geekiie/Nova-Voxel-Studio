@@ -39,6 +39,18 @@ async function openDb(dbPath) {
   return db
 }
 
+function ensureSingleDbBackup(dbPath) {
+  const backupPath = `${dbPath}.bak`
+  if (fs.existsSync(backupPath)) return { created: false, path: backupPath }
+  try {
+    fs.copyFileSync(dbPath, backupPath, fs.constants.COPYFILE_EXCL)
+  } catch (e) {
+    if (e?.code === 'EEXIST') return { created: false, path: backupPath }
+    throw e
+  }
+  return { created: true, path: backupPath }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1500,
@@ -231,11 +243,12 @@ ipcMain.handle('nova:replaceDbAsset', async (_evt, { dbPath, key, valueBuffer } 
     const outBytes = db.export()
     try { db.close() } catch {}
 
+    const backup = ensureSingleDbBackup(dbPath)
     fs.writeFileSync(dbPath, Buffer.from(outBytes))
     // invalidate cache
     const cached = dbCache.get(dbPath)
     if (cached) { try { cached.db.close() } catch {} ; dbCache.delete(dbPath) }
-    return { ok: true }
+    return { ok: true, backupCreated: backup.created, backupPath: backup.path }
   } catch (e) {
     return { ok: false, error: String(e?.message || e) }
   }

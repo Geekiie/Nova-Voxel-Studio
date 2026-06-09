@@ -44,11 +44,11 @@ On the right side of the UI:
 2. Open **data1.db**
 3. Find the asset you want
 4. Drag it into the workspace to edit it
-5. **Create Backup** before you replace anything
+5. Optionally click **Create Backup** if you want a manual backup copy
 6. Right click an asset and choose **Replace with current layer**
 
 ## Backups
-Backups only save the **.db file you currently have open** (not the entire Cube World folder).
+Automatic replacement backups save one `.bak` next to the **.db file you currently have open**. If that `.bak` already exists, replacement keeps it and does not create another automatic backup. Manual backups from **Create Backup** still save a copy to the folder you choose.
 
 ## Troubleshooting
 **Blank/gray window**

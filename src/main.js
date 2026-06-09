@@ -24,7 +24,7 @@ const state = {
   theme: 'dark', activeColor: '#7aa2ff', brushSize: 1, tool: 'voxelBrush',
   voxelMap: new Map(), selected: new Set(), undo: [], redo: [],
   shortcuts: JSON.parse(localStorage.getItem('nova.shortcuts') || 'null') || { ...DEFAULT_SHORTCUTS },
-  pointer: { painting: false, resizeBrush: false, resizeStartX: 0, resizeStartSize: 1, lastKey: null, prevTool: null, lastForwardPlaceAt: 0, altEyedropActive: false, lockAreaKeys: new Set(), scaleStart: null, lastClientX: null, lastClientY: null },
+  pointer: { painting: false, resizeBrush: false, resizeStartX: 0, resizeStartSize: 1, lastKey: null, lastTargetKey: null, prevTool: null, lastForwardPlaceAt: 0, altEyedropActive: false, lockAreaKeys: new Set(), scaleStart: null, lastClientX: null, lastClientY: null },
   scaleMode: false, shiftDown: false,
   uiTyping: false,
   layerClipboard: null,
@@ -278,9 +278,24 @@ let shadowsEnabled = true
 let shaderEnabled = true
 let perfModeActive = false
 const VOXEL_CHUNK_SIZE = 12
+const VOXEL_EDGE_PAIRS = [
+  [-0.5, -0.5, -0.5,  0.5, -0.5, -0.5],
+  [ 0.5, -0.5, -0.5,  0.5, -0.5,  0.5],
+  [ 0.5, -0.5,  0.5, -0.5, -0.5,  0.5],
+  [-0.5, -0.5,  0.5, -0.5, -0.5, -0.5],
+  [-0.5,  0.5, -0.5,  0.5,  0.5, -0.5],
+  [ 0.5,  0.5, -0.5,  0.5,  0.5,  0.5],
+  [ 0.5,  0.5,  0.5, -0.5,  0.5,  0.5],
+  [-0.5,  0.5,  0.5, -0.5,  0.5, -0.5],
+  [-0.5, -0.5, -0.5, -0.5,  0.5, -0.5],
+  [ 0.5, -0.5, -0.5,  0.5,  0.5, -0.5],
+  [ 0.5, -0.5,  0.5,  0.5,  0.5,  0.5],
+  [-0.5, -0.5,  0.5, -0.5,  0.5,  0.5]
+]
 const frustum = new THREE.Frustum()
 const camProjMatrix = new THREE.Matrix4()
 let chunkCullFrame = 0
+let voxelOutlineMaterial = null
 
 // Proxy used for voxel-layer transforms (keeps gizmo stable while chunks rebuild).
 const voxelGizmoProxy = new THREE.Object3D()
@@ -562,7 +577,6 @@ transform.addEventListener('mouseUp', () => {
   }
   rebuildLayersUI()
 })
-scene.add(transform)
 scene.add(transform.getHelper())
 
 const keyOf = (x, y, z) => `${x},${y},${z}`
@@ -684,7 +698,9 @@ function chunkKeyForXYZ(x, y, z) {
 }
 function ensureLayerIndex(layer) {
   if (!layer.chunkIndex) layer.chunkIndex = new Map()
-  if (!layer.render) layer.render = { pivot: null, inner: null, chunks: new Map() }
+  if (!layer.render) layer.render = { pivot: null, inner: null, chunks: new Map(), outlines: new Map() }
+  if (!layer.render.chunks) layer.render.chunks = new Map()
+  if (!layer.render.outlines) layer.render.outlines = new Map()
 }
 function indexVoxelKey(layer, key) {
   ensureLayerIndex(layer)
@@ -707,6 +723,92 @@ function rebuildLayerChunkIndex(layer) {
   ensureLayerIndex(layer)
   layer.chunkIndex.clear()
   for (const k of layer.voxelMap.keys()) indexVoxelKey(layer, k)
+}
+function colorsEqual(a, b) {
+  return !!a && !!b && a.r === b.r && a.g === b.g && a.b === b.b
+}
+function getVoxelOutlineMaterial() {
+  if (!voxelOutlineMaterial) voxelOutlineMaterial = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.42 })
+  return voxelOutlineMaterial
+}
+function outlinesEnabled() {
+  return !!document.getElementById('toggleOutlineBtn')?.classList.contains('active')
+}
+function ensureVoxelOutlineGroup() {
+  if (!voxelOutlineGroup) {
+    voxelOutlineGroup = new THREE.Group()
+    voxelOutlineGroup.userData.isVoxelOutlineGroup = true
+    root.add(voxelOutlineGroup)
+  }
+  return voxelOutlineGroup
+}
+function disposeGeometryObject(obj, disposeMaterial = false) {
+  if (!obj) return
+  try { obj.geometry?.dispose?.() } catch {}
+  if (disposeMaterial) {
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+    for (const m of mats) {
+      try { m?.dispose?.() } catch {}
+    }
+  }
+}
+function removeChunkOutline(layer, chunkKey) {
+  ensureLayerIndex(layer)
+  const existing = layer.render.outlines.get(chunkKey)
+  if (!existing) return
+  try { voxelOutlineGroup?.remove(existing) } catch {}
+  disposeGeometryObject(existing, false)
+  layer.render.outlines.delete(chunkKey)
+}
+function rebuildChunkOutline(layer, chunkKey) {
+  ensureLayerIndex(layer)
+  removeChunkOutline(layer, chunkKey)
+  if (!outlinesEnabled()) return
+  const set = layer.chunkIndex?.get(chunkKey)
+  if (!set?.size) return
+  const pos = []
+  for (const k of set) {
+    const [x, y, z] = parseKey(k)
+    if (
+      layer.voxelMap.has(keyOf(x + 1, y, z)) &&
+      layer.voxelMap.has(keyOf(x - 1, y, z)) &&
+      layer.voxelMap.has(keyOf(x, y + 1, z)) &&
+      layer.voxelMap.has(keyOf(x, y - 1, z)) &&
+      layer.voxelMap.has(keyOf(x, y, z + 1)) &&
+      layer.voxelMap.has(keyOf(x, y, z - 1))
+    ) continue
+    for (const e of VOXEL_EDGE_PAIRS) {
+      pos.push(
+        x + e[0], y + e[1], z + e[2],
+        x + e[3], y + e[4], z + e[5]
+      )
+    }
+  }
+  if (!pos.length) return
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3))
+  geo.computeBoundingSphere()
+  const ls = new THREE.LineSegments(geo, getVoxelOutlineMaterial())
+  ls.frustumCulled = true
+  ls.userData.isVoxelOutlineChunk = true
+  ls.userData.layerId = layer.id
+  ls.userData.chunkKey = chunkKey
+  ensureVoxelOutlineGroup().add(ls)
+  layer.render.outlines.set(chunkKey, ls)
+}
+function clearVoxelOutlines() {
+  if (voxelOutlineGroup) {
+    for (const child of [...voxelOutlineGroup.children]) {
+      voxelOutlineGroup.remove(child)
+      disposeGeometryObject(child, false)
+    }
+    root.remove(voxelOutlineGroup)
+  }
+  voxelOutlineGroup = null
+  for (const layer of voxelLayers) {
+    ensureLayerIndex(layer)
+    layer.render.outlines = new Map()
+  }
 }
 function ensureVoxelWorker() {
   if (voxelWorker) return voxelWorker
@@ -1730,12 +1832,10 @@ function voxelizeModel() {
   syncStateVoxelMapToActiveLayer()
   layerOrder.push({ type: 'voxel', id: newId })
   closeSmallVoxelGaps()
-  const beforeReduce = state.voxelMap.size
-  reduceLargeVoxelMapIfNeeded()
-  const afterReduce = state.voxelMap.size
+  const filledInterior = fillVoxelInterior(state.voxelMap, { r: 128, g: 128, b: 128 })
+  const finalCount = state.voxelMap.size
   applyPerformanceModeByVoxelCount()
-  if (afterReduce < beforeReduce) setStatus(`Large model optimized: ${beforeReduce.toLocaleString()} -> ${afterReduce.toLocaleString()} voxels`)
-  else setStatus(`Voxelized ${afterReduce.toLocaleString()} voxels`)
+  setStatus(`Voxelized ${finalCount.toLocaleString()} solid voxels${filledInterior ? ` (${filledInterior.toLocaleString()} interior filled)` : ''}`)
   // Keep voxelization interactive: skip heavy post ray-bake pass.
   rebuildVoxelMesh()
 
@@ -1786,6 +1886,120 @@ function closeSmallVoxelGaps() {
     }
     if (c > 0) state.voxelMap.set(k, { r: Math.round(sr / c), g: Math.round(sg / c), b: Math.round(sb / c) })
   }
+}
+
+function fillVoxelInteriorByScanlines(voxelMap, fillColor) {
+  const rangesX = new Map(), rangesY = new Map(), rangesZ = new Map()
+  const updateRange = (map, lineKey, v) => {
+    const r = map.get(lineKey)
+    if (r) { if (v < r.min) r.min = v; if (v > r.max) r.max = v }
+    else map.set(lineKey, { min: v, max: v })
+  }
+  for (const k of voxelMap.keys()) {
+    const [x, y, z] = parseKey(k)
+    updateRange(rangesX, `${y},${z}`, x)
+    updateRange(rangesY, `${x},${z}`, y)
+    updateRange(rangesZ, `${x},${y}`, z)
+  }
+  const candidates = new Map()
+  const vote = (k) => candidates.set(k, (candidates.get(k) || 0) + 1)
+  for (const [line, r] of rangesX.entries()) {
+    if (r.max - r.min <= 1) continue
+    const [y, z] = line.split(',').map(Number)
+    for (let x = r.min + 1; x < r.max; x++) {
+      const k = keyOf(x, y, z)
+      if (!voxelMap.has(k)) vote(k)
+    }
+  }
+  for (const [line, r] of rangesY.entries()) {
+    if (r.max - r.min <= 1) continue
+    const [x, z] = line.split(',').map(Number)
+    for (let y = r.min + 1; y < r.max; y++) {
+      const k = keyOf(x, y, z)
+      if (!voxelMap.has(k)) vote(k)
+    }
+  }
+  for (const [line, r] of rangesZ.entries()) {
+    if (r.max - r.min <= 1) continue
+    const [x, y] = line.split(',').map(Number)
+    for (let z = r.min + 1; z < r.max; z++) {
+      const k = keyOf(x, y, z)
+      if (!voxelMap.has(k)) vote(k)
+    }
+  }
+  let filled = 0
+  for (const [k, votes] of candidates.entries()) {
+    if (votes < 2 || voxelMap.has(k)) continue
+    voxelMap.set(k, { ...fillColor })
+    filled++
+  }
+  return filled
+}
+
+function fillVoxelInterior(voxelMap, fillColor = { r: 128, g: 128, b: 128 }) {
+  if (!voxelMap?.size) return 0
+  let minX = Infinity, minY = Infinity, minZ = Infinity
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
+  for (const k of voxelMap.keys()) {
+    const [x, y, z] = parseKey(k)
+    if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z
+    if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z
+  }
+  minX -= 1; minY -= 1; minZ -= 1
+  maxX += 1; maxY += 1; maxZ += 1
+  const sx = maxX - minX + 1
+  const sy = maxY - minY + 1
+  const sz = maxZ - minZ + 1
+  const total = sx * sy * sz
+  const FLOOD_FILL_CELL_CAP = 16000000
+  if (!Number.isSafeInteger(total) || total <= 0 || total > FLOOD_FILL_CELL_CAP) {
+    return fillVoxelInteriorByScanlines(voxelMap, fillColor)
+  }
+
+  const stateGrid = new Uint8Array(total)
+  const encode = (x, y, z) => ((z - minZ) * sy + (y - minY)) * sx + (x - minX)
+  for (const k of voxelMap.keys()) {
+    const [x, y, z] = parseKey(k)
+    stateGrid[encode(x, y, z)] = 1
+  }
+
+  const queue = new Int32Array(total)
+  let head = 0, tail = 0
+  const pushOutside = (idx) => {
+    if (stateGrid[idx] !== 0) return
+    stateGrid[idx] = 2
+    queue[tail++] = idx
+  }
+  pushOutside(0)
+  while (head < tail) {
+    const idx = queue[head++]
+    const xLocal = idx % sx
+    const yz = (idx - xLocal) / sx
+    const yLocal = yz % sy
+    const zLocal = (yz - yLocal) / sy
+    if (xLocal > 0) pushOutside(idx - 1)
+    if (xLocal < sx - 1) pushOutside(idx + 1)
+    if (yLocal > 0) pushOutside(idx - sx)
+    if (yLocal < sy - 1) pushOutside(idx + sx)
+    const zStride = sx * sy
+    if (zLocal > 0) pushOutside(idx - zStride)
+    if (zLocal < sz - 1) pushOutside(idx + zStride)
+  }
+
+  let filled = 0
+  for (let z = minZ + 1; z <= maxZ - 1; z++) {
+    for (let y = minY + 1; y <= maxY - 1; y++) {
+      for (let x = minX + 1; x <= maxX - 1; x++) {
+        const idx = encode(x, y, z)
+        if (stateGrid[idx] !== 0) continue
+        const k = keyOf(x, y, z)
+        if (voxelMap.has(k)) continue
+        voxelMap.set(k, { ...fillColor })
+        filled++
+      }
+    }
+  }
+  return filled
 }
 
 function reduceLargeVoxelMapIfNeeded() {
@@ -1929,10 +2143,9 @@ function rebuildVoxelMesh() {
 
   if (voxelMesh) root.remove(voxelMesh)
   if (voxelGroup) root.remove(voxelGroup)
-  if (voxelOutlineGroup) root.remove(voxelOutlineGroup)
+  clearVoxelOutlines()
   voxelMesh = null
   voxelGroup = null
-  voxelOutlineGroup = null
   voxelGroup = new THREE.Group()
   // Build all voxel layers (including active drawing layer).
   for (const l of voxelLayers) {
@@ -1943,6 +2156,7 @@ function rebuildVoxelMesh() {
     l.render.pivot = l.group
     l.render.inner = l.group.children?.find((c) => c.userData?.isVoxelLayerInner) || l.group.children?.[0] || l.group
     l.render.chunks = new Map()
+    l.render.outlines = new Map()
     for (const child of (l.render.inner?.children || [])) {
       if (child?.userData?.isChunk && child.userData.chunkKey) l.render.chunks.set(child.userData.chunkKey, child)
     }
@@ -1951,61 +2165,12 @@ function rebuildVoxelMesh() {
   root.add(voxelGroup)
   updateChunkVisibility(true)
 
-  // Optional outlines (per-voxel edges for surface voxels; still cheap-ish because it's one merged LineSegments).
-  const outlineOn = document.getElementById('toggleOutlineBtn')?.classList.contains('active')
-  if (outlineOn) {
-    voxelOutlineGroup = new THREE.Group()
-    const lineMat = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.42 })
-    const edgePairs = [
-      // bottom square
-      [-0.5, -0.5, -0.5,  0.5, -0.5, -0.5],
-      [ 0.5, -0.5, -0.5,  0.5, -0.5,  0.5],
-      [ 0.5, -0.5,  0.5, -0.5, -0.5,  0.5],
-      [-0.5, -0.5,  0.5, -0.5, -0.5, -0.5],
-      // top square
-      [-0.5,  0.5, -0.5,  0.5,  0.5, -0.5],
-      [ 0.5,  0.5, -0.5,  0.5,  0.5,  0.5],
-      [ 0.5,  0.5,  0.5, -0.5,  0.5,  0.5],
-      [-0.5,  0.5,  0.5, -0.5,  0.5, -0.5],
-      // verticals
-      [-0.5, -0.5, -0.5, -0.5,  0.5, -0.5],
-      [ 0.5, -0.5, -0.5,  0.5,  0.5, -0.5],
-      [ 0.5, -0.5,  0.5,  0.5,  0.5,  0.5],
-      [-0.5, -0.5,  0.5, -0.5,  0.5,  0.5]
-    ]
-    // Build per-layer so "same position in different layer" can still be outlined cleanly.
+  if (outlinesEnabled()) {
+    ensureVoxelOutlineGroup()
     for (const layer of voxelLayers) {
-      const vm = layer.voxelMap
-      if (!vm?.size) continue
-      // Surface voxels only.
-      const pos = []
-      for (const k of vm.keys()) {
-        const [x, y, z] = parseKey(k)
-        // If fully surrounded, skip.
-        if (
-          vm.has(keyOf(x + 1, y, z)) &&
-          vm.has(keyOf(x - 1, y, z)) &&
-          vm.has(keyOf(x, y + 1, z)) &&
-          vm.has(keyOf(x, y - 1, z)) &&
-          vm.has(keyOf(x, y, z + 1)) &&
-          vm.has(keyOf(x, y, z - 1))
-        ) continue
-        for (const e of edgePairs) {
-          pos.push(
-            x + e[0], y + e[1], z + e[2],
-            x + e[3], y + e[4], z + e[5]
-          )
-        }
-      }
-      if (!pos.length) continue
-      const g = new THREE.BufferGeometry()
-      g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3))
-      g.computeBoundingSphere()
-      const ls = new THREE.LineSegments(g, lineMat)
-      ls.frustumCulled = true
-      voxelOutlineGroup.add(ls)
+      ensureLayerIndex(layer)
+      for (const chunkKey of layer.chunkIndex.keys()) rebuildChunkOutline(layer, chunkKey)
     }
-    root.add(voxelOutlineGroup)
   }
 
   if (proxyActiveLayerId) {
@@ -2065,6 +2230,15 @@ function markDirtyChunksForVoxelKey(layer, voxelKey) {
     enqueueDirtyChunk(layer.id, `${cx + d[0]},${cy + d[1]},${cz + d[2]}`)
   }
 }
+function markDirtyChunkForVoxelColor(layer, voxelKey) {
+  const [x, y, z] = parseKey(voxelKey)
+  enqueueDirtyChunk(layer.id, chunkKeyForXYZ(x, y, z))
+}
+function markAllLayerChunksDirty(layer) {
+  ensureLayerIndex(layer)
+  if (!layer.chunkIndex.size && layer.voxelMap?.size) rebuildLayerChunkIndex(layer)
+  for (const chunkKey of layer.chunkIndex.keys()) enqueueDirtyChunk(layer.id, chunkKey)
+}
 function gatherChunkAndNeighborOccupancy(layer, cx, cy, cz) {
   // Occupancy used only for face-culling checks while building this chunk.
   const occ = new Set()
@@ -2097,10 +2271,10 @@ async function rebuildChunkMesh(layer, chunkKey) {
   if (!voxKeys.length) {
     if (existing) {
       layer.render.inner.remove(existing)
-      existing.geometry?.dispose?.()
-      existing.material?.dispose?.()
+      disposeGeometryObject(existing, true)
       layer.render.chunks.delete(chunkKey)
     }
+    rebuildChunkOutline(layer, chunkKey)
     return true
   }
 
@@ -2139,8 +2313,7 @@ async function rebuildChunkMesh(layer, chunkKey) {
 
   const mesh = existing || new THREE.Mesh(geo, mat)
   if (existing) {
-    existing.geometry?.dispose?.()
-    existing.material?.dispose?.()
+    disposeGeometryObject(existing, true)
     mesh.geometry = geo
     mesh.material = mat
   } else {
@@ -2162,6 +2335,7 @@ async function rebuildChunkMesh(layer, chunkKey) {
     new THREE.Vector3(minX, minY, minZ),
     new THREE.Vector3(minX + size, minY + size, minZ + size)
   )
+  rebuildChunkOutline(layer, chunkKey)
   return true
 }
 function buildChunkOnMain(payload) {
@@ -2430,6 +2604,62 @@ function brushKeys(centerKey, hitPoint = null) {
   for (const o of offs) out.push(keyOf(cx + o[0], cy + o[1], cz + o[2]))
   return out
 }
+function strokeToolUsesTargetInterpolation() {
+  return state.tool === 'voxelBrush' || state.tool === 'eraser' || state.tool === 'paintBrush'
+}
+function targetKeyForHit(hit) {
+  if (!hit) return null
+  if (hit.type === 'floor' && (state.tool === 'voxelBrush' || state.tool === 'eraser')) {
+    return keyOf(Math.floor(hit.point.x), 0, Math.floor(hit.point.z))
+  }
+  if (hit.type !== 'voxel') return null
+  if (state.tool === 'voxelBrush') {
+    const [x, y, z] = parseKey(hit.key)
+    const n = hit.normal.clone().round()
+    return keyOf(x + n.x, y + n.y, z + n.z)
+  }
+  if (state.tool === 'eraser' || state.tool === 'paintBrush' || state.tool === 'airBrush') return hit.key
+  return null
+}
+function supercoverLineKeys(fromKey, toKey) {
+  if (!fromKey || !toKey || fromKey === toKey) return toKey ? [toKey] : []
+  const [x0, y0, z0] = parseKey(fromKey)
+  const [x1, y1, z1] = parseKey(toKey)
+  const dx = x1 - x0, dy = y1 - y0, dz = z1 - z0
+  const steps = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz))
+  if (steps <= 0) return [toKey]
+  const out = []
+  let prev = null
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps
+    const k = keyOf(
+      Math.round(x0 + dx * t),
+      Math.round(y0 + dy * t),
+      Math.round(z0 + dz * t)
+    )
+    if (k !== prev) out.push(k)
+    prev = k
+  }
+  return out
+}
+function applyStrokeStep(hit, addMask = true) {
+  const target = targetKeyForHit(hit)
+  if (!strokeToolUsesTargetInterpolation() || !target) {
+    applyTool(hit, addMask)
+    state.pointer.lastTargetKey = target
+    return
+  }
+  if (!state.pointer.lastTargetKey || state.pointer.lastTargetKey === target) {
+    applyTool(hit, addMask)
+    state.pointer.lastTargetKey = target
+    return
+  }
+  const keys = supercoverLineKeys(state.pointer.lastTargetKey, target)
+  for (let i = 0; i < keys.length; i++) {
+    applyTool(hit, addMask, keys[i], { ignoreHoverLock: i < keys.length - 1 })
+  }
+  state.pointer.lastTargetKey = target
+}
 function setVoxel(key, color) {
   const c = color ?? hexToRgb(state.activeColor)
   const safe = {
@@ -2439,7 +2669,7 @@ function setVoxel(key, color) {
   }
   state.voxelMap.set(key, safe)
 }
-function setVoxelInLayer(layer, key, color) {
+function setVoxelInLayer(layer, key, color, opts = {}) {
   ensureLayerIndex(layer)
   const c = color ?? hexToRgb(state.activeColor)
   const safe = {
@@ -2447,16 +2677,22 @@ function setVoxelInLayer(layer, key, color) {
     g: Number.isFinite(c?.g) ? c.g : 162,
     b: Number.isFinite(c?.b) ? c.b : 255
   }
+  const existing = layer.voxelMap.get(key)
+  if (colorsEqual(existing, safe)) return false
+  const existed = !!existing
   layer.voxelMap.set(key, safe)
-  indexVoxelKey(layer, key)
-  markDirtyChunksForVoxelKey(layer, key)
+  if (!existed) indexVoxelKey(layer, key)
+  if (!existed || opts.geometry !== false) markDirtyChunksForVoxelKey(layer, key)
+  else markDirtyChunkForVoxelColor(layer, key)
+  return true
 }
 function deleteVoxelInLayer(layer, key) {
   ensureLayerIndex(layer)
-  if (!layer.voxelMap.has(key)) return
+  if (!layer.voxelMap.has(key)) return false
   layer.voxelMap.delete(key)
   deindexVoxelKey(layer, key)
   markDirtyChunksForVoxelKey(layer, key)
+  return true
 }
 function hexToRgb(h) {
   if (!h || typeof h !== 'string' || !h.startsWith('#') || h.length < 7) return { r: 122, g: 162, b: 255 }
@@ -2465,6 +2701,15 @@ function hexToRgb(h) {
   return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 }
 }
 function neighbors(k) { const [x, y, z] = parseKey(k); return [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]].map((d) => keyOf(x + d[0], y + d[1], z + d[2])) }
+function keysOverlap(set, keys) {
+  for (const k of keys) if (set.has(k)) return true
+  return false
+}
+function expandedVoxelArea(keys) {
+  const out = new Set(keys)
+  for (const k of keys) for (const nk of neighbors(k)) out.add(nk)
+  return out
+}
 
 function ensureStrokeOverlayMeshes() {
   if (state.strokeOverlay.addInst && state.strokeOverlay.delInst) return
@@ -2589,14 +2834,11 @@ function commitStrokeOps() {
   for (const k of changedKeys) markDirtyChunksForVoxelKey(layer, k)
   // Kick rebuild pipeline.
   processChunkRebuildQueue()
-  // If outlines are enabled, we keep correctness by rebuilding outlines after the commit (not during stroke).
-  const outlineOn = document.getElementById('toggleOutlineBtn')?.classList.contains('active')
-  if (outlineOn) rebuildVoxelMesh()
   rebuildSelection()
   strokeOverlayReset()
 }
 
-function applyTool(hit, addMask = true) {
+function applyTool(hit, addMask = true, forcedTargetKey = null, opts = {}) {
   if (!hit) return
   // Most tools operate on the active voxel layer (drawing target).
   // Some tools (bucket/picker) operate on the clicked layer.
@@ -2605,64 +2847,89 @@ function applyTool(hit, addMask = true) {
   const baseLayer = getActiveVoxelLayer()
   const baseMap = baseLayer?.voxelMap || state.voxelMap
   if (hit.type === 'floor' && (state.tool === 'voxelBrush' || state.tool === 'eraser')) {
-    const gx = Math.floor(hit.point.x)
-    const gy = 0
-    const gz = Math.floor(hit.point.z)
-    const floorKey = keyOf(gx, gy, gz)
+    const floorKey = forcedTargetKey || targetKeyForHit(hit)
     const keys = brushKeys(floorKey, hit.point)
+    let changed = false
     if (state.tool === 'voxelBrush') {
       for (const k of keys) {
-        setVoxelInLayer(baseLayer, k, c)
+        if (strokeVisited.has(k) || baseLayer.voxelMap.has(k)) continue
+        if (setVoxelInLayer(baseLayer, k, c)) {
+          strokeVisited.add(k)
+          changed = true
+        }
       }
     } else {
+      if (keysOverlap(state.pointer.lockAreaKeys, keys)) return
       for (const k of keys) {
-        deleteVoxelInLayer(baseLayer, k)
+        if (strokeVisited.has(k)) continue
+        if (deleteVoxelInLayer(baseLayer, k)) {
+          strokeVisited.add(k)
+          changed = true
+        }
       }
     }
-    syncStateVoxelMapToActiveLayer()
-    processChunkRebuildQueue()
+    if (changed) {
+      if (state.tool === 'eraser') state.pointer.lockAreaKeys = expandedVoxelArea(keys)
+      syncStateVoxelMapToActiveLayer()
+      processChunkRebuildQueue()
+    }
     return
   }
   if (hit.type !== 'voxel') return
-  if (state.pointer.lastKey === hit.key && state.tool !== 'airBrush') return
   state.pointer.lastKey = hit.key
   if (state.tool === 'voxelBrush') {
-    const [x, y, z] = parseKey(hit.key)
-    const n = hit.normal.clone().round()
-    const viewDir = new THREE.Vector3().subVectors(camera.position, hit.point).normalize()
-    const facing = n.dot(viewDir)
-    if (facing > 0.6) {
-      const now = performance.now()
-      if (state.pointer.lastForwardPlaceAt && now - state.pointer.lastForwardPlaceAt < 90) return
-      state.pointer.lastForwardPlaceAt = now
-    }
     const hoverArea = new Set(brushKeys(hit.key, hit.point))
     let overlapsLockedArea = false
     for (const k of hoverArea) {
       if (state.pointer.lockAreaKeys.has(k)) { overlapsLockedArea = true; break }
     }
     // Must leave the area before placing again.
-    if (overlapsLockedArea) return
-    const base = keyOf(x + n.x, y + n.y, z + n.z)
-    for (const k of brushKeys(base, hit.point)) {
-      setVoxelInLayer(baseLayer, k, c)
+    if (overlapsLockedArea && !opts.ignoreHoverLock) return
+    const base = forcedTargetKey || targetKeyForHit(hit)
+    const targetArea = brushKeys(base, hit.point)
+    let changed = false
+    for (const k of targetArea) {
+      if (strokeVisited.has(k) || baseLayer.voxelMap.has(k)) continue
+      if (setVoxelInLayer(baseLayer, k, c)) {
+        strokeVisited.add(k)
+        changed = true
+      }
     }
-    state.pointer.lockAreaKeys = hoverArea
-    syncStateVoxelMapToActiveLayer()
-    processChunkRebuildQueue()
+    if (changed) {
+      state.pointer.lockAreaKeys = new Set([...hoverArea, ...targetArea])
+      syncStateVoxelMapToActiveLayer()
+      processChunkRebuildQueue()
+    }
   } else if (state.tool === 'eraser') {
-    for (const k of brushKeys(hit.key, hit.point)) {
-      deleteVoxelInLayer(baseLayer, k)
+    const targetArea = brushKeys(forcedTargetKey || hit.key, hit.point)
+    if (keysOverlap(state.pointer.lockAreaKeys, targetArea)) return
+    let changed = false
+    for (const k of targetArea) {
+      if (strokeVisited.has(k)) continue
+      if (deleteVoxelInLayer(baseLayer, k)) {
+        strokeVisited.add(k)
+        changed = true
+      }
     }
-    syncStateVoxelMapToActiveLayer()
-    processChunkRebuildQueue()
+    if (changed) {
+      state.pointer.lockAreaKeys = expandedVoxelArea(targetArea)
+      syncStateVoxelMapToActiveLayer()
+      processChunkRebuildQueue()
+    }
   } else if (state.tool === 'paintBrush') {
-    for (const k of brushKeys(hit.key, hit.point)) {
+    let changed = false
+    for (const k of brushKeys(forcedTargetKey || hit.key, hit.point)) {
+      if (strokeVisited.has(k)) continue
       if (!baseMap.has(k)) continue
-      setVoxelInLayer(baseLayer, k, c)
+      if (setVoxelInLayer(baseLayer, k, c, { geometry: false })) {
+        strokeVisited.add(k)
+        changed = true
+      }
     }
-    syncStateVoxelMapToActiveLayer()
-    processChunkRebuildQueue()
+    if (changed) {
+      syncStateVoxelMapToActiveLayer()
+      processChunkRebuildQueue()
+    }
   } else if (state.tool === 'airBrush') {
     // Soft recolor with radial falloff (strongest at center).
     const [cx, cy, cz] = parseKey(hit.key)
@@ -2682,13 +2949,11 @@ function applyTool(hit, addMask = true) {
       const d = Math.hypot(x - cx, y - cy, z - cz)
       const falloff = Math.exp(-(d * d) / (2 * sigma * sigma))
       const t = strengthBase * falloff
-      baseLayer.voxelMap.set(k, {
+      setVoxelInLayer(baseLayer, k, {
         r: Math.round(cur.r + (c.r - cur.r) * t),
         g: Math.round(cur.g + (c.g - cur.g) * t),
         b: Math.round(cur.b + (c.b - cur.b) * t)
-      })
-      // mark dirty chunks for recolored voxels (surface faces only depend on occupancy, but colors need redraw)
-      markDirtyChunksForVoxelKey(baseLayer, k)
+      }, { geometry: false })
     }
     syncStateVoxelMapToActiveLayer()
     processChunkRebuildQueue()
@@ -2698,13 +2963,17 @@ function applyTool(hit, addMask = true) {
     const layer = voxelLayers.find((l) => l.id === layerId) || getActiveVoxelLayer()
     const base = layer?.voxelMap?.get(hit.key)
     if (!base) return
+    let changed = 0
     for (const [k, cc] of layer.voxelMap.entries()) {
-      if (cc && cc.r === base.r && cc.g === base.g && cc.b === base.b) layer.voxelMap.set(k, { r: c.r, g: c.g, b: c.b })
+      if (!cc || cc.r !== base.r || cc.g !== base.g || cc.b !== base.b) continue
+      if (colorsEqual(cc, c)) continue
+      layer.voxelMap.set(k, { r: c.r, g: c.g, b: c.b })
+      markDirtyChunkForVoxelColor(layer, k)
+      changed++
     }
+    if (!changed) return
     if (layer.id === activeVoxelLayerId) syncStateVoxelMapToActiveLayer()
-    rebuildLayerChunkIndex(layer)
-    // many voxels recolored: easiest is full rebuild (still occupancy-same but chunk meshes need new colors)
-    rebuildVoxelMesh()
+    processChunkRebuildQueue()
   } else if (state.tool === 'picker') {
     // Pick from the clicked layer, not necessarily the active drawing layer.
     const layerId = hit.layerId || activeVoxelLayerId
@@ -3017,14 +3286,11 @@ canvas.addEventListener('pointermove', (e) => {
   const doStep = (sx, sy) => {
     const hit = pickPaintAtClientXY(sx, sy)
     if (!hit) {
-      if (state.tool === 'voxelBrush') state.pointer.lockAreaKeys = new Set()
+      if (state.tool === 'voxelBrush' || state.tool === 'eraser') state.pointer.lockAreaKeys = new Set()
+      state.pointer.lastTargetKey = null
       return
     }
-    // Apply tool at the sampled screen-space position only.
-    // (Do not "bridge" between voxel keys in voxel-space; that can create chords through tight curves.)
-    if (hit.key && strokeVisited.has(hit.key) && state.tool !== 'airBrush') return
-    if (hit.key) strokeVisited.add(hit.key)
-    applyTool(hit, !state.shiftDown)
+    applyStrokeStep(hit, !state.shiftDown)
   }
 
   if (lx == null || ly == null) {
@@ -3113,13 +3379,21 @@ canvas.addEventListener('pointerdown', (e) => {
   }
 
   if (e.button !== 0) return
+  if (state.tool === 'bucket') {
+    if (hit?.type === 'voxel') {
+      pushUndo()
+      applyTool(hit, !state.shiftDown)
+    }
+    controls.enabled = true
+    return
+  }
   if (hit?.type === 'voxel' || hit?.type === 'floor') {
     controls.enabled = false
-    state.pointer.painting = true; state.pointer.lastKey = null; strokeVisited = new Set(); pushUndo()
+    state.pointer.painting = true; state.pointer.lastKey = null; state.pointer.lastTargetKey = null; strokeVisited = new Set(); pushUndo()
     state.pointer.lastClientX = e.clientX
     state.pointer.lastClientY = e.clientY
     state.pointer.lockAreaKeys = new Set()
-    applyTool(hit, !state.shiftDown)
+    applyStrokeStep(hit, !state.shiftDown)
   } else controls.enabled = true
 })
 
@@ -3129,6 +3403,7 @@ window.addEventListener('pointerup', () => {
   state.pointer.lockAreaKeys = new Set()
   state.pointer.lastClientX = null
   state.pointer.lastClientY = null
+  state.pointer.lastTargetKey = null
   // nothing special on stroke end; chunks are rebuilt incrementally while painting
   if (state.pointer.resizeBrush) state.pointer.resizeBrush = false
   if (state.pointer.prevTool && !state.pointer.altEyedropActive) { state.tool = state.pointer.prevTool; state.pointer.prevTool = null; rebuildToolState() }
@@ -3556,7 +3831,8 @@ function openHslWindow() {
     }
     modified = true
     if (layer.id === activeVoxelLayerId) syncStateVoxelMapToActiveLayer()
-    rebuildVoxelMesh()
+    markAllLayerChunksDirty(layer)
+    processChunkRebuildQueue()
   }
   const schedule = () => {
     if (raf) return
@@ -3574,7 +3850,8 @@ function openHslWindow() {
   const revert = () => {
     layer.voxelMap = new Map([...original.entries()].map(([k, c]) => [k, { r: c.r, g: c.g, b: c.b }]))
     if (layer.id === activeVoxelLayerId) syncStateVoxelMapToActiveLayer()
-    rebuildVoxelMesh()
+    markAllLayerChunksDirty(layer)
+    processChunkRebuildQueue()
   }
 
   win.querySelector('#hslCloseX')?.addEventListener('click', (e) => {
@@ -3610,6 +3887,8 @@ function openHslWindow() {
         layer.voxelMap.set(k, { r: Math.round(col.r * 255), g: Math.round(col.g * 255), b: Math.round(col.b * 255) })
       }
       if (layer.id === activeVoxelLayerId) syncStateVoxelMapToActiveLayer()
+      markAllLayerChunksDirty(layer)
+      processChunkRebuildQueue()
     }
     cleanup()
   })
@@ -3924,7 +4203,7 @@ function renderKeyList() {
         const targetId = (selectedLayer.type === 'voxel' && selectedLayer.id) ? selectedLayer.id : activeVoxelLayerId
         const layer = voxelLayers.find((l) => l.id === targetId) || getActiveVoxelLayer()
         if (!layer?.voxelMap?.size) { alert('Current layer has no voxels.'); return }
-        const ok = confirm(`Replace ${key} inside ${assetState.selectedDb.name}?\n\nThis will modify the .db file on disk. A .bak will be created.`)
+        const ok = confirm(`Replace ${key} inside ${assetState.selectedDb.name}?\n\nThis will modify the .db file on disk. A .bak backup will be created if one does not already exist.`)
         if (!ok) return
         const bytes = makeCubBytesFromVoxelMap(layer.voxelMap)
         if (!bytes) { alert('Failed to build .cub bytes from current layer.'); return }
@@ -3933,7 +4212,7 @@ function renderKeyList() {
           if (!res?.ok) throw new Error(res?.error || 'Replace failed')
           // refresh preview + list
           await previewSelectedAsset()
-          alert('Replaced successfully.')
+          alert(res.backupCreated ? 'Replaced successfully. Backup created.' : 'Replaced successfully. Existing backup was kept.')
         } catch (err) {
           alert(`Replace failed: ${err?.message || err}`)
         }
