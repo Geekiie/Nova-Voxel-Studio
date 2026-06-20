@@ -14,6 +14,13 @@ set "ELECTRON_BUILDER_CACHE=%cd%\.electron-builder-cache"
 REM Some setups have this set globally, which breaks Electron apps.
 set "ELECTRON_RUN_AS_NODE="
 
+REM Some PCs have npm configured for production installs, which skips Electron
+REM because Electron is a devDependency in source releases.
+set "NODE_ENV="
+set "npm_config_production="
+set "npm_config_omit="
+set "npm_config_include=dev"
+
 REM Always use the Windows cmd shim for npm (avoids weird npm.ps1 behavior).
 set "NPM_CMD=npm.cmd"
 where /q %NPM_CMD%
@@ -36,9 +43,7 @@ if errorlevel 1 (
 
 :start
 if not exist "node_modules" (
-  echo Installing dependencies...
-  call %NPM_CMD% config set cache ".npm-cache" --location=project >nul 2>nul
-  call %NPM_CMD% install
+  call :install_deps
   if errorlevel 1 goto :err
   REM deps are in; jump back through the normal flow (same window)
   goto :start
@@ -67,13 +72,45 @@ REM Launch Electron, then exit so this cmd window closes.
 set "ELECTRON_EXE=%cd%\\node_modules\\electron\\dist\\electron.exe"
 if not exist "%ELECTRON_EXE%" (
   echo.
-  echo Electron is missing. Try deleting node_modules and running this again.
-  pause
-  exit /b 1
+  echo Electron is missing. Repairing dependencies...
+  call :repair_electron
+  if errorlevel 1 goto :electron_missing
+  goto :start
+)
+
+if "%NOVA_LAUNCHER_CHECK_ONLY%"=="1" (
+  echo Launcher check passed.
+  exit /b 0
 )
 
 start "" /d "%cd%" "%ELECTRON_EXE%" . >nul 2>nul
 exit /b 0
+
+:install_deps
+echo Installing dependencies...
+call %NPM_CMD% config set cache ".npm-cache" --location=project >nul 2>nul
+call %NPM_CMD% install --include=dev
+exit /b %errorlevel%
+
+:repair_electron
+call %NPM_CMD% config set cache ".npm-cache" --location=project >nul 2>nul
+call %NPM_CMD% install --include=dev
+if errorlevel 1 exit /b 1
+call %NPM_CMD% rebuild electron --include=dev
+if errorlevel 1 exit /b 1
+if not exist "%ELECTRON_EXE%" exit /b 1
+exit /b 0
+
+:electron_missing
+echo.
+echo Electron is still missing after repair.
+echo Expected: %ELECTRON_EXE%
+echo.
+echo This usually means antivirus quarantined Electron, the folder is locked,
+echo or the download/extraction is incomplete. Move the folder somewhere normal
+echo like Desktop, allow it in antivirus if needed, then run this launcher again.
+pause
+exit /b 1
 
 :err
 echo.
