@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .npm-cache/
+.electron-cache/
+.electron-builder-cache/
 .vite/
 
 # local projects
@@ -15,4 +17,3 @@ yarn-error.log*
 # OS junk
 .DS_Store
 Thumbs.db
-
